@@ -16,7 +16,7 @@ pub struct Storage {
 }
 
 impl Storage {
-    pub async fn new(key_id: String, secret_key: String) -> Self {
+    pub fn new(key_id: String, secret_key: String) -> Self {
         let creds = Credentials::new(
             key_id.clone(),
             secret_key.clone(),
