@@ -9,10 +9,11 @@ use tokio::sync::broadcast::Receiver;
 
 pub struct Storage {
     client: Arc<Client>,
+    min_part_size: usize,
 }
 
 impl Storage {
-    pub fn new(endpoint: String, key_id: String, secret_key: String) -> Self {
+    pub fn new(endpoint: String, key_id: String, secret_key: String, min_part_size: usize) -> Self {
         let creds = Credentials::new(
             key_id.clone(),
             secret_key.clone(),
@@ -32,6 +33,7 @@ impl Storage {
 
         Self {
             client: Arc::new(client),
+            min_part_size,
         }
     }
 
@@ -41,39 +43,104 @@ impl Storage {
         object_key: &str,
         mut rx: Receiver<AuPayload>,
     ) -> Result<(), PutObjectError> {
+        let mut buffer_aac = BytesMut::new();
+        let mut buffer_avc = BytesMut::new();
         let mut part_number_aac = 0;
         let mut part_number_avc = 0;
+        let mut dts: Option<i64> = None;
 
         while let Ok(payload) = rx.recv().await {
-            let byte_stream = ByteStream::from(payload.lp_to_nal_start_code());
-            let client = Arc::clone(&self.client);
-            let bucket = bucket_name.to_string();
-            let key = object_key.to_string();
-            let kind = payload.kind.clone();
-            let dts = payload.dts();
-            let pts = payload.pts();
-            tokio::task::spawn(async move {
-                upload_part(
-                    client,
-                    bucket,
-                    key,
-                    byte_stream,
-                    kind,
-                    part_number_aac,
-                    part_number_avc,
-                    dts,
-                    pts,
-                )
-                .await;
-            });
+            if dts.is_none() {
+                dts = Some(payload.dts());
+            }
 
-            match payload.kind {
-                AuKind::AAC => part_number_aac += 1,
-                AuKind::AVC => part_number_avc += 1,
-                _ => {}
+            let buffer = match payload.kind {
+                AuKind::AAC => &mut buffer_aac,
+                AuKind::AVC => &mut buffer_avc,
+                _ => continue,
+            };
+
+            buffer.extend_from_slice(&payload.lp_to_nal_start_code());
+            if buffer.len() >= self.min_part_size {
+                let client = Arc::clone(&self.client);
+                let bucket = bucket_name.to_string();
+                let key = object_key.to_string();
+                let kind = payload.kind.clone();
+
+                let part_data = buffer.split_to(buffer.len()).freeze();
+                tokio::task::spawn(async move {
+                    upload_part(
+                        client,
+                        bucket,
+                        key,
+                        part_data,
+                        kind,
+                        part_number_aac,
+                        part_number_avc,
+                        dts,
+                    )
+                    .await;
+                });
+
+                match payload.kind {
+                    AuKind::AAC => part_number_aac += 1,
+                    AuKind::AVC => part_number_avc += 1,
+                    _ => {}
+                }
             }
         }
 
+        let client = Arc::clone(&self.client);
+        let bucket = bucket_name.to_string();
+        let key = object_key.to_string();
+
+        self.flush_remaining(
+            Arc::clone(&client),
+            bucket.to_string(),
+            key.to_string(),
+            buffer_aac.freeze(),
+            AuKind::AAC,
+            part_number_aac,
+            dts,
+        )
+        .await?;
+        self.flush_remaining(
+            client,
+            bucket,
+            key,
+            buffer_avc.freeze(),
+            AuKind::AVC,
+            part_number_avc,
+            dts,
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    async fn flush_remaining(
+        &self,
+        client: Arc<Client>,
+        bucket: String,
+        key: String,
+        buffer: Bytes,
+        kind: AuKind,
+        part_number: usize,
+        dts: Option<i64>,
+    ) -> Result<(), PutObjectError> {
+        if !buffer.is_empty() {
+            upload_part(
+                client,
+                bucket,
+                key,
+                buffer,
+                kind,
+                part_number,
+                part_number,
+                dts,
+            )
+            .await;
+        }
         Ok(())
     }
 }
@@ -82,12 +149,11 @@ async fn upload_part(
     client: Arc<Client>,
     bucket: String,
     key: String,
-    body: ByteStream,
+    buffer: Bytes,
     kind: AuKind,
     part_number_aac: usize,
     part_number_avc: usize,
-    dts: i64,
-    pts: i64,
+    dts: Option<i64>,
 ) {
     let key_suffix = match kind {
         AuKind::AAC => format!("{}/{}.aac", key, part_number_aac),
@@ -95,16 +161,18 @@ async fn upload_part(
         _ => unreachable!(),
     };
 
-    client
+    let byte_stream = ByteStream::from(buffer);
+    let mut req = client
         .put_object()
         .bucket(bucket.to_string())
         .key(key_suffix)
-        .body(body)
-        .metadata("dts", &dts.to_string())
-        .metadata("pts", &pts.to_string())
-        .send()
-        .await
-        .map_err(|e| {
-            dbg!(e);
-        });
+        .body(byte_stream);
+
+    if let Some(v) = dts {
+        req = req.metadata("dts", &v.to_string());
+    }
+
+    req.send().await.map_err(|e| {
+        dbg!(e);
+    });
 }
