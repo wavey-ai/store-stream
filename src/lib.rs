@@ -1,5 +1,3 @@
-use aws_config::SdkConfig;
-use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_sdk_s3::config::Credentials;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Error as S3Error;
@@ -16,7 +14,7 @@ pub struct Storage {
 }
 
 impl Storage {
-    pub fn new(key_id: String, secret_key: String) -> Self {
+    pub fn new(endpoint: String, key_id: String, secret_key: String) -> Self {
         let creds = Credentials::new(
             key_id.clone(),
             secret_key.clone(),
@@ -25,11 +23,15 @@ impl Storage {
             "StaticCredentials",
         );
 
-        let conf = SdkConfig::builder()
-            .credentials_provider(SharedCredentialsProvider::new(creds))
-            .region(Region::new("us-east-1"))
+        let s3_config = aws_sdk_s3::config::Builder::new()
+            .endpoint_url(endpoint)
+            .credentials_provider(creds)
+            .region(Region::new("eu-central-1"))
+            .force_path_style(true)
             .build();
-        let client = Client::new(&conf);
+
+        let client = Client::from_conf(s3_config);
+
         Self {
             client: Arc::new(client),
         }
