@@ -1,4 +1,4 @@
-use au::AuPayload;
+use au::{AuKind, AuPayload};
 use aws_sdk_s3::config::Credentials;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Error as S3Error;
@@ -50,25 +50,41 @@ impl Storage {
 
         let mut buffer = BytesMut::new();
 
-        let mut part_number = 0;
+        let mut aac_part_number = 0;
+        let mut avc_part_number = 0;
+
         let mut dts: Option<i64> = None;
         while let Ok(payload) = rx.recv().await {
             if dts.is_none() {
                 dts = Some(payload.dts());
             }
 
+            let obj_key = match payload.kind {
+                AuKind::AAC => {
+                    let key = format!("{}/{}.aac", key, aac_part_number);
+                    aac_part_number += 1;
+                    key
+                }
+                AuKind::AVC => {
+                    let key = format!("{}/{}.avc", key, avc_part_number);
+                    avc_part_number += 1;
+                    key
+                }
+                _ => "NotImplemented".to_string(),
+            };
+
             buffer.extend_from_slice(&payload.lp_to_nal_start_code());
             if buffer.len() >= self.min_part_size {
                 let part_data = buffer.split_to(buffer.len()).freeze();
                 let bucket = bucket.clone();
-                let key = key.clone();
+                let key = obj_key.clone();
                 let client = Arc::clone(&client);
                 tokio::task::spawn(async move {
                     let byte_stream = ByteStream::from(part_data);
                     let mut req = client
                         .put_object()
                         .bucket(bucket.to_string())
-                        .key(format!("{}/{}", key, part_number))
+                        .key(key)
                         .body(byte_stream);
                     if let Some(ref v) = dts {
                         req = req.metadata("dts", format!("{}", v));
@@ -82,26 +98,6 @@ impl Storage {
                 });
 
                 dts = None;
-                part_number += 1;
-            }
-        }
-
-        if !buffer.is_empty() {
-            let part_data = buffer.split_to(buffer.len()).freeze();
-            let byte_stream = ByteStream::from(part_data);
-            let mut req = client
-                .put_object()
-                .bucket(bucket.to_string())
-                .key(format!("{}/{}", key, part_number))
-                .body(byte_stream);
-            if let Some(ref v) = dts {
-                req = req.metadata("dts", format!("{}", v));
-            }
-            match req.send().await {
-                Ok(_) => {}
-                Err(e) => {
-                    dbg!(e);
-                }
             }
         }
 
