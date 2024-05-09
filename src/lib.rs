@@ -7,14 +7,13 @@ use bytes::BytesMut;
 use std::sync::Arc;
 use tokio::sync::broadcast::Receiver;
 
-const PART_SIZE: usize = 1 * 1024 * 1024;
-
 pub struct Storage {
     client: Arc<Client>,
+    min_part_size: usize,
 }
 
 impl Storage {
-    pub fn new(endpoint: String, key_id: String, secret_key: String) -> Self {
+    pub fn new(endpoint: String, key_id: String, secret_key: String, min_part_size: usize) -> Self {
         let creds = Credentials::new(
             key_id.clone(),
             secret_key.clone(),
@@ -34,6 +33,7 @@ impl Storage {
 
         Self {
             client: Arc::new(client),
+            min_part_size,
         }
     }
 
@@ -58,7 +58,7 @@ impl Storage {
             }
 
             buffer.extend_from_slice(&payload.lp_to_nal_start_code());
-            if buffer.len() >= PART_SIZE {
+            if buffer.len() >= self.min_part_size {
                 let part_data = buffer.split_to(buffer.len()).freeze();
                 let bucket = bucket.clone();
                 let key = key.clone();
