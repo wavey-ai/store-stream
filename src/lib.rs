@@ -1,8 +1,10 @@
 use aws_sdk_s3::config::Credentials;
+use aws_sdk_s3::config::Region;
 use aws_sdk_s3::operation::put_object::PutObjectError;
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::{config::Region, Client};
+use aws_sdk_s3::Client;
 use bytes::{Bytes, BytesMut};
+use std::error::Error;
 use std::sync::Arc;
 use tokio::sync::broadcast::Receiver;
 
@@ -36,12 +38,40 @@ impl Storage {
         }
     }
 
+    async fn bucket_exists(&self, bucket_name: &str) -> Result<bool, Box<dyn Error + Send + Sync>> {
+        match self.client.head_bucket().bucket(bucket_name).send().await {
+            Ok(_) => Ok(true),
+            Err(e) => Err(Box::new(e) as Box<dyn Error + Send + Sync>),
+        }
+    }
+
+    async fn create_bucket(&self, bucket_name: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+        match self.client.create_bucket().bucket(bucket_name).send().await {
+            Ok(_) => Ok(()),
+            Err(e) => Err(Box::new(e) as Box<dyn Error + Send + Sync>),
+        }
+    }
+
+    async fn upsert_bucket(&self, bucket_name: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let exists = self.bucket_exists(bucket_name).await?;
+        if !exists {
+            match self.create_bucket(bucket_name).await {
+                Ok(_) => Ok(()),
+                Err(e) => Err(e),
+            }
+        } else {
+            Ok(())
+        }
+    }
+
     pub async fn upload(
         &self,
         bucket_name: &str,
         object_key: &str,
         mut rx: Receiver<Bytes>,
-    ) -> Result<(), PutObjectError> {
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        self.upsert_bucket(bucket_name).await?;
+
         let mut buffer = BytesMut::new();
         let mut pkt_num = 0;
 
@@ -89,6 +119,49 @@ impl Storage {
         }
         Ok(())
     }
+
+    pub async fn list_bucket(
+        &self,
+        bucket_name: &str,
+    ) -> Result<ListBucketResult, Box<dyn Error + Send + Sync>> {
+        let mut objects = Vec::new();
+
+        let mut response = self
+            .client
+            .list_objects_v2()
+            .bucket(bucket_name.to_owned())
+            .max_keys(1000)
+            .into_paginator()
+            .send();
+
+        while let Some(result) = response.next().await {
+            match result {
+                Ok(output) => {
+                    objects.extend(output.contents().iter().map(|object| S3Object {
+                        key: object.key().unwrap_or_default().to_string(),
+                        size: object.size().unwrap_or_default(),
+                    }));
+                }
+                Err(err) => {
+                    eprintln!("{err:?}");
+                    return Err(Box::new(err));
+                }
+            }
+        }
+
+        Ok(ListBucketResult { objects })
+    }
+}
+
+#[derive(Debug)]
+pub struct ListBucketResult {
+    pub objects: Vec<S3Object>,
+}
+
+#[derive(Debug)]
+pub struct S3Object {
+    pub key: String,
+    pub size: i64,
 }
 
 async fn upload_part(
