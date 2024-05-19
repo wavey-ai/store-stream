@@ -8,6 +8,7 @@ use std::error::Error;
 use std::sync::Arc;
 use tokio::sync::broadcast::Receiver;
 
+#[derive(Clone)]
 pub struct Storage {
     client: Arc<Client>,
     min_part_size: usize,
