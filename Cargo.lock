@@ -51,6 +51,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyhow"
+version = "1.0.86"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b3d1d046238990b9cf5bcde22a3fb3584ee5cf65fb2765f454ed428c7a0063da"
+
+[[package]]
 name = "au"
 version = "0.1.0"
 source = "git+http://github.com/wavey-ai/au.git#644a58e32e792ee2745f6f50e1e5d7bf53f35cac"
@@ -1467,6 +1473,7 @@ dependencies = [
 name = "storage"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "au",
  "aws-config",
  "aws-credential-types",
@@ -1474,6 +1481,7 @@ dependencies = [
  "aws-types",
  "bytes",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

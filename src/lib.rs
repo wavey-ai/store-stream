@@ -1,12 +1,11 @@
-use aws_sdk_s3::config::Credentials;
-use aws_sdk_s3::config::Region;
-use aws_sdk_s3::operation::put_object::PutObjectError;
+use anyhow::{anyhow, Result};
+use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use bytes::{Bytes, BytesMut};
-use std::error::Error;
 use std::sync::Arc;
-use tokio::sync::broadcast::Receiver;
+use tokio::sync::mpsc;
+use tracing::{error, info};
 
 #[derive(Clone)]
 pub struct Storage {
@@ -16,21 +15,13 @@ pub struct Storage {
 
 impl Storage {
     pub fn new(endpoint: String, key_id: String, secret_key: String, min_part_size: usize) -> Self {
-        let creds = Credentials::new(
-            key_id.clone(),
-            secret_key.clone(),
-            None,
-            None,
-            "StaticCredentials",
-        );
-
+        let creds = Credentials::new(key_id, secret_key, None, None, "StaticCredentials");
         let s3_config = aws_sdk_s3::config::Builder::new()
             .endpoint_url(endpoint)
             .credentials_provider(creds)
             .region(Region::new("eu-central-1"))
             .force_path_style(true)
             .build();
-
         let client = Client::from_conf(s3_config);
 
         Self {
@@ -39,55 +30,141 @@ impl Storage {
         }
     }
 
-    async fn bucket_exists(&self, bucket_name: &str) -> Result<bool, Box<dyn Error + Send + Sync>> {
-        match self.client.head_bucket().bucket(bucket_name).send().await {
-            Ok(_) => Ok(true),
-            Err(e) => Err(Box::new(e) as Box<dyn Error + Send + Sync>),
-        }
+    async fn bucket_exists(&self, bucket_name: &str) -> Result<bool> {
+        self.client
+            .head_bucket()
+            .bucket(bucket_name)
+            .send()
+            .await
+            .map(|_| true)
+            .map_err(|e| anyhow!(e))
     }
 
-    async fn create_bucket(&self, bucket_name: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-        match self.client.create_bucket().bucket(bucket_name).send().await {
-            Ok(_) => Ok(()),
-            Err(e) => Err(Box::new(e) as Box<dyn Error + Send + Sync>),
-        }
+    async fn create_bucket(&self, bucket_name: &str) -> Result<()> {
+        self.client
+            .create_bucket()
+            .bucket(bucket_name)
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|e| anyhow!(e))
     }
 
-    async fn upsert_bucket(&self, bucket_name: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let exists = self.bucket_exists(bucket_name).await?;
-        if !exists {
-            match self.create_bucket(bucket_name).await {
-                Ok(_) => Ok(()),
-                Err(e) => Err(e),
-            }
+    async fn upsert_bucket(&self, bucket_name: &str) -> Result<()> {
+        if !self.bucket_exists(bucket_name).await? {
+            self.create_bucket(bucket_name).await
         } else {
             Ok(())
         }
+    }
+
+    pub async fn get_byte_range(
+        &self,
+        bucket_name: &str,
+        object_key: &str,
+        range_start: usize,
+        range_end: usize,
+    ) -> Result<Bytes> {
+        let offsets_bytes = self.fetch_object(bucket_name, object_key).await?;
+        let offsets = deserialize_offsets(&offsets_bytes)?;
+
+        if offsets.is_empty() {
+            return Err(anyhow!("No offsets found for object"));
+        }
+
+        let mut parts_to_fetch = Vec::new();
+        let mut part_start_index = 0;
+
+        while part_start_index < offsets.len() && offsets[part_start_index] < range_start as u64 {
+            part_start_index += 1;
+        }
+        part_start_index = part_start_index.saturating_sub(1);
+
+        if offsets[part_start_index] > range_start as u64 && part_start_index > 0 {
+            part_start_index -= 1;
+        }
+
+        for (i, offset) in offsets.iter().enumerate().skip(part_start_index) {
+            if *offset > range_end as u64 {
+                break;
+            }
+            parts_to_fetch.push(i);
+        }
+
+        if parts_to_fetch.is_empty() {
+            return Err(anyhow!("The requested range is not covered by any parts."));
+        }
+
+        let mut result_bytes = BytesMut::new();
+        for part_index in &parts_to_fetch {
+            let part_key = format!("{}.{}", object_key, part_index);
+            let part_bytes = self.fetch_object(bucket_name, &part_key).await?;
+            result_bytes.extend_from_slice(&part_bytes);
+        }
+
+        let result_bytes = result_bytes.freeze();
+
+        let first_part_offset = offsets[parts_to_fetch[0]] as usize;
+        let slice_start = (range_start - first_part_offset).max(0);
+        let slice_end = slice_start + (range_end - range_start);
+
+        let required_bytes = result_bytes.slice(slice_start..slice_end);
+
+        Ok(required_bytes)
+    }
+
+    async fn fetch_object(&self, bucket_name: &str, object_key: &str) -> Result<Bytes> {
+        let byte_stream = self
+            .client
+            .get_object()
+            .bucket(bucket_name)
+            .key(object_key)
+            .send()
+            .await?
+            .body
+            .collect()
+            .await?;
+        Ok(byte_stream.into_bytes())
     }
 
     pub async fn upload(
         &self,
         bucket_name: &str,
         object_key: &str,
-        mut rx: Receiver<Bytes>,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        mut rx: mpsc::Receiver<Bytes>,
+    ) -> Result<()> {
+        let (tx_offset, mut rx_offset) = mpsc::channel::<u64>(16);
+        let client = Arc::clone(&self.client);
+        let bucket = bucket_name.to_string();
+        let key = object_key.to_string();
+        tokio::task::spawn(async move {
+            let mut offsets = Vec::new();
+            while let Some(n) = rx_offset.recv().await {
+                offsets.push(n);
+                let serialized_offsets = serialize_offsets(&offsets);
+                let bytes = Bytes::from(serialized_offsets);
+                put(client.clone(), bucket.to_string(), key.to_string(), bytes).await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+
         self.upsert_bucket(bucket_name).await?;
 
         let mut buffer = BytesMut::new();
         let mut pkt_num = 0;
-
-        while let Ok(payload) = rx.recv().await {
+        let mut offset = 0;
+        while let Some(payload) = rx.recv().await {
             buffer.extend_from_slice(&payload);
             if buffer.len() >= self.min_part_size {
                 let client = Arc::clone(&self.client);
                 let bucket = bucket_name.to_string();
                 let key = object_key.to_string();
-
-                let part_data = buffer.split_to(buffer.len()).freeze();
-                tokio::task::spawn(async move {
-                    upload_part(client, bucket, key, part_data, pkt_num).await;
-                });
+                let len = buffer.len();
+                let part_data = buffer.split_to(len).freeze();
+                upload_part(client, bucket, key, part_data, pkt_num).await?;
                 pkt_num += 1;
+                tx_offset.send(offset).await?;
+                offset += len as u64;
             }
         }
 
@@ -114,17 +191,14 @@ impl Storage {
         key: String,
         buffer: Bytes,
         pkt_num: usize,
-    ) -> Result<(), PutObjectError> {
+    ) -> Result<()> {
         if !buffer.is_empty() {
-            upload_part(client, bucket, key, buffer, pkt_num).await;
+            upload_part(client, bucket, key, buffer, pkt_num).await?;
         }
         Ok(())
     }
 
-    pub async fn list_bucket(
-        &self,
-        bucket_name: &str,
-    ) -> Result<ListBucketResult, Box<dyn Error + Send + Sync>> {
+    pub async fn list_bucket(&self, bucket_name: &str) -> Result<ListBucketResult> {
         let mut objects = Vec::new();
 
         let mut response = self
@@ -143,10 +217,7 @@ impl Storage {
                         size: object.size().unwrap_or_default(),
                     }));
                 }
-                Err(err) => {
-                    eprintln!("{err:?}");
-                    return Err(Box::new(err));
-                }
+                Err(err) => return Err(anyhow!(err)),
             }
         }
 
@@ -165,26 +236,66 @@ pub struct S3Object {
     pub size: i64,
 }
 
+async fn put(
+    client: Arc<Client>,
+    bucket_name: String,
+    object_key: String,
+    body: Bytes,
+) -> Result<()> {
+    let bucket = bucket_name.to_string();
+    let key = object_key.to_string();
+    let byte_stream = ByteStream::from(body);
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(byte_stream)
+        .send()
+        .await
+        .map(|_| ())
+        .map_err(|e| anyhow!(e))
+}
+
 async fn upload_part(
     client: Arc<Client>,
     bucket: String,
     key: String,
     buffer: Bytes,
     pkt_num: usize,
-) {
-    let key_suffix = format!("{}/{}.ts", key, pkt_num);
+) -> Result<()> {
+    let key_suffix = format!("{}.{}", key, pkt_num);
     let byte_stream = ByteStream::from(buffer);
-    match client
+    client
         .put_object()
-        .bucket(bucket.to_string())
+        .bucket(bucket)
         .key(key_suffix)
         .body(byte_stream)
         .send()
         .await
-    {
-        Ok(_) => {}
-        Err(e) => {
-            dbg!(e);
-        }
-    };
+        .map(|_| ())
+        .map_err(|e| anyhow!(e))
+}
+
+fn serialize_offsets(offsets: &Vec<u64>) -> Vec<u8> {
+    offsets
+        .iter()
+        .map(|&offset| offset.to_be_bytes())
+        .flatten()
+        .collect()
+}
+
+fn deserialize_offsets(bytes: &[u8]) -> Result<Vec<u64>> {
+    if bytes.len() % 8 != 0 {
+        return Err(anyhow!("Invalid byte length for offsets"));
+    }
+    let mut offsets = Vec::with_capacity(bytes.len() / 8);
+    for chunk in bytes.chunks_exact(8) {
+        let offset = u64::from_be_bytes(
+            chunk
+                .try_into()
+                .map_err(|_| anyhow!("Failed to convert bytes to u64"))?,
+        );
+        offsets.push(offset);
+    }
+    Ok(offsets)
 }

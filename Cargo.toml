@@ -13,3 +13,5 @@ au = { git = "http://github.com/wavey-ai/au.git" }
 aws-credential-types = { version = "1.2.0", features = [
   "hardcoded-credentials",
 ] }
+anyhow = "1.0.86"
+tracing = "0.1.40"
