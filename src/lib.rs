@@ -19,7 +19,7 @@ impl Storage {
         let s3_config = aws_sdk_s3::config::Builder::new()
             .endpoint_url(endpoint)
             .credentials_provider(creds)
-            .region(Region::new("eu-central-1"))
+            .region(Region::new("eu-west-2"))
             .force_path_style(true)
             .build();
         let client = Client::from_conf(s3_config);
@@ -97,7 +97,7 @@ impl Storage {
 
         let mut result_bytes = BytesMut::new();
         for part_index in &parts_to_fetch {
-            let part_key = format!("{}.{}", object_key, part_index);
+            let part_key = format!("{}/{}", object_key, part_index);
             let part_bytes = self.fetch_object(bucket_name, &part_key).await?;
             result_bytes.extend_from_slice(&part_bytes);
         }
@@ -205,7 +205,7 @@ impl Storage {
             .client
             .list_objects_v2()
             .bucket(bucket_name.to_owned())
-            .max_keys(1000)
+            .max_keys(10)
             .into_paginator()
             .send();
 
@@ -263,7 +263,7 @@ async fn upload_part(
     buffer: Bytes,
     pkt_num: usize,
 ) -> Result<()> {
-    let key_suffix = format!("{}.{}", key, pkt_num);
+    let key_suffix = format!("{}/{}", key, pkt_num);
     let byte_stream = ByteStream::from(buffer);
     client
         .put_object()
@@ -298,4 +298,95 @@ fn deserialize_offsets(bytes: &[u8]) -> Result<Vec<u64>> {
         offsets.push(offset);
     }
     Ok(offsets)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use std::env;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    const TEST_ENDPOINT: &str = "https://wavey-test.fr-par-1.linodeobjects.com";
+    const TEST_BUCKET_NAME: &str = "wavey-test";
+    const MIN_PART_SIZE: usize = 5 * 1024 * 1024; // 5 MB
+
+    fn get_env_var(key: &str) -> String {
+        env::var(key).expect(&format!("Environment variable {} not set", key))
+    }
+
+    fn create_storage() -> Storage {
+        let key_id = get_env_var("TEST_KEY_ID");
+        let secret_key = get_env_var("TEST_SECRET_KEY");
+        Storage::new(TEST_ENDPOINT.to_string(), key_id, secret_key, MIN_PART_SIZE)
+    }
+
+    #[tokio::test]
+    async fn test_bucket_creation() {
+        let storage = create_storage();
+        let result = storage.create_bucket(TEST_BUCKET_NAME).await;
+        assert!(result.is_ok(), "Bucket creation failed: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn test_bucket_existence() {
+        let storage = create_storage();
+        let result = storage.bucket_exists(TEST_BUCKET_NAME).await;
+        assert!(
+            result.is_ok(),
+            "Checking bucket existence failed: {:?}",
+            result.err()
+        );
+        assert!(result.unwrap(), "Bucket does not exist when it should.");
+    }
+
+    #[tokio::test]
+    async fn test_upload_and_retrieve_object() {
+        let storage = create_storage();
+        let (tx, rx) = mpsc::channel(16);
+
+        let upload_task = tokio::spawn(async move {
+            let data = Bytes::from("Hello, S3!");
+            tx.send(data).await.unwrap();
+        });
+
+        let upload_result = storage.upload(TEST_BUCKET_NAME, "test-object", rx).await;
+        assert!(
+            upload_result.is_ok(),
+            "Object upload failed: {:?}",
+            upload_result.err()
+        );
+
+        upload_task.await.unwrap();
+
+        let fetched_data = storage
+            .fetch_object(TEST_BUCKET_NAME, "test-object/0")
+            .await;
+        assert!(
+            fetched_data.is_ok(),
+            "Object fetch failed: {:?}",
+            fetched_data.err()
+        );
+
+        let fetched_bytes = fetched_data.unwrap();
+        assert_eq!(
+            fetched_bytes,
+            Bytes::from("Hello, S3!"),
+            "Fetched data does not match uploaded data."
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_bucket() {
+        let storage = create_storage();
+        let result = storage.list_bucket(TEST_BUCKET_NAME).await;
+        assert!(result.is_ok(), "Listing bucket failed: {:?}", result.err());
+
+        let list_result = result.unwrap();
+        assert!(
+            !list_result.objects.is_empty(),
+            "Bucket is empty when it should have objects."
+        );
+    }
 }
