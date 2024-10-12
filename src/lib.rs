@@ -137,6 +137,9 @@ impl Storage {
         let client = Arc::clone(&self.client);
         let bucket = bucket_name.to_string();
         let key = object_key.to_string();
+
+        self.upsert_bucket(bucket_name).await?;
+
         tokio::task::spawn(async move {
             let mut offsets = Vec::new();
             while let Some(n) = rx_offset.recv().await {
@@ -147,8 +150,6 @@ impl Storage {
             }
             Ok::<(), anyhow::Error>(())
         });
-
-        self.upsert_bucket(bucket_name).await?;
 
         let mut buffer = BytesMut::new();
         let mut pkt_num = 0;
