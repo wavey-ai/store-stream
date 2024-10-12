@@ -270,7 +270,7 @@ async fn upload_part(
     buffer: Bytes,
     pkt_num: usize,
 ) -> Result<()> {
-    let key_suffix = format!("{}/{}", key, pkt_num);
+    let key_suffix = format!("{}/{:010}", key, pkt_num);
     let byte_stream = ByteStream::from(buffer);
     client
         .put_object()
