@@ -146,7 +146,13 @@ impl Storage {
                 offsets.push(n);
                 let serialized_offsets = serialize_offsets(&offsets);
                 let bytes = Bytes::from(serialized_offsets);
-                put(client.clone(), bucket.to_string(), key.to_string(), bytes).await?;
+                put(
+                    client.clone(),
+                    bucket.to_string(),
+                    format!("{}.dat", key),
+                    bytes,
+                )
+                .await?;
             }
             Ok::<(), anyhow::Error>(())
         });
