@@ -102,8 +102,8 @@ impl Storage {
 
         let mut result_bytes = BytesMut::new();
         for part_index in &parts_to_fetch {
-            let part_key = format!("{}/{}", object_key, part_index);
-            debug!("get object {}/{}", bucket_name, part_key);
+            let part_key = format!("{}/{:010}", object_key, part_index);
+            debug!("get object {}/{}", bucket_name, &part_key);
             let part_bytes = self.fetch_object(bucket_name, &part_key).await?;
             result_bytes.extend_from_slice(&part_bytes);
         }
