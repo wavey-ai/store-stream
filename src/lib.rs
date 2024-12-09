@@ -66,7 +66,9 @@ impl Storage {
         range_start: usize,
         range_end: Option<usize>,
     ) -> Result<Bytes> {
-        let offsets_bytes = self.fetch_object(bucket_name, object_key).await?;
+        let offsets_bytes = self
+            .fetch_object(bucket_name, &format!("{}.dat", object_key))
+            .await?;
         let offsets = deserialize_offsets(&offsets_bytes)?;
 
         if offsets.is_empty() {
