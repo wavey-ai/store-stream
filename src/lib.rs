@@ -3,6 +3,7 @@ use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use bytes::{Bytes, BytesMut};
+use std::slice::SliceIndex;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info};
@@ -63,7 +64,7 @@ impl Storage {
         bucket_name: &str,
         object_key: &str,
         range_start: usize,
-        range_end: usize,
+        range_end: Option<usize>,
     ) -> Result<Bytes> {
         let offsets_bytes = self.fetch_object(bucket_name, object_key).await?;
         let offsets = deserialize_offsets(&offsets_bytes)?;
@@ -85,8 +86,10 @@ impl Storage {
         }
 
         for (i, offset) in offsets.iter().enumerate().skip(part_start_index) {
-            if *offset > range_end as u64 {
-                break;
+            if let Some(range_end) = range_end {
+                if *offset > range_end as u64 {
+                    break;
+                }
             }
             parts_to_fetch.push(i);
         }
@@ -106,11 +109,13 @@ impl Storage {
 
         let first_part_offset = offsets[parts_to_fetch[0]] as usize;
         let slice_start = (range_start - first_part_offset).max(0);
-        let slice_end = slice_start + (range_end - range_start);
+        let slice_end = if let Some(range_end) = range_end {
+            slice_start + (range_end - range_start)
+        } else {
+            result_bytes.len()
+        };
 
-        let required_bytes = result_bytes.slice(slice_start..slice_end);
-
-        Ok(required_bytes)
+        Ok(result_bytes.slice(slice_start..slice_end))
     }
 
     async fn fetch_object(&self, bucket_name: &str, object_key: &str) -> Result<Bytes> {
