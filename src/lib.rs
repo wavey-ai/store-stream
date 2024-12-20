@@ -3,7 +3,6 @@ use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use bytes::{Bytes, BytesMut};
-use std::slice::SliceIndex;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
@@ -118,7 +117,7 @@ impl Storage {
             result_bytes.len()
         };
 
-        Ok(result_bytes.slice(slice_start..slice_end))
+        Ok(result_bytes.slice(slice_start..slice_end.min(result_bytes.len())))
     }
 
     async fn fetch_object(&self, bucket_name: &str, object_key: &str) -> Result<Bytes> {
