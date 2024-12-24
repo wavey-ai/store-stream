@@ -2,6 +2,10 @@
 name = "store-stream"
 version = "0.1.0"
 edition = "2021"
+description = "Parted storage for large files to S3"
+license = "MIT"
+repository = "https://github.com/wavey-ai/store-stream"
+readme = "README.md"
 
 [dependencies]
 tokio = { version = "1.37.0", features = ["sync", "macros"] }
