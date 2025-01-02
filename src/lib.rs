@@ -10,11 +10,10 @@ use tracing::{debug, error, info};
 #[derive(Clone)]
 pub struct Storage {
     client: Arc<Client>,
-    min_part_size: usize,
 }
 
 impl Storage {
-    pub fn new(endpoint: String, key_id: String, secret_key: String, min_part_size: usize) -> Self {
+    pub fn new(endpoint: String, key_id: String, secret_key: String) -> Self {
         let creds = Credentials::new(key_id, secret_key, None, None, "StaticCredentials");
         let s3_config = aws_sdk_s3::config::Builder::new()
             .endpoint_url(endpoint)
@@ -26,7 +25,6 @@ impl Storage {
 
         Self {
             client: Arc::new(client),
-            min_part_size,
         }
     }
 
@@ -139,6 +137,7 @@ impl Storage {
         bucket_name: &str,
         object_key: &str,
         mut rx: mpsc::Receiver<Bytes>,
+        min_part_size: usize,
     ) -> Result<()> {
         let (tx_offset, mut rx_offset) = mpsc::channel::<u64>(16);
         let client = Arc::clone(&self.client);
@@ -169,7 +168,7 @@ impl Storage {
         let mut offset = 0;
         while let Some(payload) = rx.recv().await {
             buffer.extend_from_slice(&payload);
-            if buffer.len() >= self.min_part_size {
+            if buffer.len() >= min_part_size {
                 let client = Arc::clone(&self.client);
                 let bucket = bucket_name.to_string();
                 let key = object_key.to_string();
@@ -320,11 +319,12 @@ mod tests {
     use bytes::Bytes;
     use std::env;
     use std::sync::Arc;
+    use std::usize::MIN;
     use tokio::sync::mpsc;
 
-    const TEST_ENDPOINT: &str = "https://wavey-test.fr-par-1.linodeobjects.com";
-    const TEST_BUCKET_NAME: &str = "wavey-test";
-    const MIN_PART_SIZE: usize = 5 * 1024 * 1024; // 5 MB
+    const TEST_ENDPOINT: &str = "http://localhost:9000";
+    const TEST_BUCKET_NAME: &str = "test";
+    const MIN_PART_SIZE: usize = 1024 * 10;
 
     fn get_env_var(key: &str) -> String {
         env::var(key).expect(&format!("Environment variable {} not set", key))
@@ -333,7 +333,7 @@ mod tests {
     fn create_storage() -> Storage {
         let key_id = get_env_var("TEST_KEY_ID");
         let secret_key = get_env_var("TEST_SECRET_KEY");
-        Storage::new(TEST_ENDPOINT.to_string(), key_id, secret_key, MIN_PART_SIZE)
+        Storage::new(TEST_ENDPOINT.to_string(), key_id, secret_key)
     }
 
     #[tokio::test]
@@ -365,7 +365,9 @@ mod tests {
             tx.send(data).await.unwrap();
         });
 
-        let upload_result = storage.upload(TEST_BUCKET_NAME, "test-object", rx).await;
+        let upload_result = storage
+            .upload(TEST_BUCKET_NAME, "test-object", rx, MIN_PART_SIZE)
+            .await;
         assert!(
             upload_result.is_ok(),
             "Object upload failed: {:?}",
