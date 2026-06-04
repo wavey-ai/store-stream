@@ -22,8 +22,7 @@ It is possible to stream multi-gb files to storage which will be saved at interv
 let storage = Storage::new(
     "https://your-endpoint.com".to_string(),
     "your-key-id".to_string(),
-    "your-secret-key".to_string(),
-    5 * 1024 * 1024 // 5MB minimum part size
+    "your-secret-key".to_string()
 );
 ```
 
@@ -43,9 +42,16 @@ tokio::spawn(async move {
     tx.send(data).await.unwrap();
 });
 
-// Upload the data
-storage.upload("bucket-name", "object-key", rx).await?;
+// Upload the data in objects of at least 5 MiB where possible.
+storage
+    .upload("bucket-name", "object-key", rx, 5 * 1024 * 1024)
+    .await?;
 ```
+
+An upload writes chunks under `object-key/0000000000`,
+`object-key/0000000001`, and so on. It also writes `object-key.dat`, a compact
+big-endian `u64` offset table. The offset table is updated after each chunk is
+stored, so byte ranges can be fetched before a long upload has completed.
 
 ### Fetching Objects
 
@@ -56,6 +62,10 @@ let bytes = storage
     .get_byte_range("bucket-name", "object-key", 0, Some(100))
     .await?;
 ```
+
+`range_end` is inclusive, matching HTTP byte range semantics. Passing `None`
+for `range_end` fetches from `range_start` through the currently available end
+of the stream.
 
 ### Bucket Operations
 
@@ -85,6 +95,16 @@ for object in result.objects {
 - Rust 2021 edition or later
 - Tokio runtime
 - AWS SDK for Rust
+
+## Tests
+
+`cargo test` runs unit tests for offset serialization and range selection.
+Live S3-compatible storage tests are marked ignored because they require a
+running endpoint and credentials:
+
+```bash
+TEST_KEY_ID=minioadmin TEST_SECRET_KEY=minioadmin cargo test -- --ignored
+```
 
 ## License
 

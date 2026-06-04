@@ -5,7 +5,7 @@ use aws_sdk_s3::Client;
 use bytes::{Bytes, BytesMut};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::debug;
 
 #[derive(Clone)]
 pub struct Storage {
@@ -29,13 +29,18 @@ impl Storage {
     }
 
     async fn bucket_exists(&self, bucket_name: &str) -> Result<bool> {
-        self.client
-            .head_bucket()
-            .bucket(bucket_name)
-            .send()
-            .await
-            .map(|_| true)
-            .map_err(|e| anyhow!(e))
+        match self.client.head_bucket().bucket(bucket_name).send().await {
+            Ok(_) => Ok(true),
+            Err(err)
+                if err
+                    .raw_response()
+                    .map(|response| response.status().as_u16())
+                    == Some(404) =>
+            {
+                Ok(false)
+            }
+            Err(err) => Err(anyhow!(err)),
+        }
     }
 
     async fn create_bucket(&self, bucket_name: &str) -> Result<()> {
@@ -63,39 +68,13 @@ impl Storage {
         range_start: usize,
         range_end: Option<usize>,
     ) -> Result<Bytes> {
+        let requested_len = inclusive_range_len(range_start, range_end)?;
         let offsets_bytes = self
             .fetch_object(bucket_name, &format!("{}.dat", object_key))
             .await?;
         let offsets = deserialize_offsets(&offsets_bytes)?;
 
-        if offsets.is_empty() {
-            return Err(anyhow!("No offsets found for object"));
-        }
-
-        let mut parts_to_fetch = Vec::new();
-        let mut part_start_index = 0;
-
-        while part_start_index < offsets.len() && offsets[part_start_index] < range_start as u64 {
-            part_start_index += 1;
-        }
-        part_start_index = part_start_index.saturating_sub(1);
-
-        if offsets[part_start_index] > range_start as u64 && part_start_index > 0 {
-            part_start_index -= 1;
-        }
-
-        for (i, offset) in offsets.iter().enumerate().skip(part_start_index) {
-            if let Some(range_end) = range_end {
-                if *offset > range_end as u64 {
-                    break;
-                }
-            }
-            parts_to_fetch.push(i);
-        }
-
-        if parts_to_fetch.is_empty() {
-            return Err(anyhow!("The requested range is not covered by any parts."));
-        }
+        let parts_to_fetch = part_indexes_for_range(&offsets, range_start, range_end)?;
 
         let mut result_bytes = BytesMut::new();
         for part_index in &parts_to_fetch {
@@ -107,10 +86,25 @@ impl Storage {
 
         let result_bytes = result_bytes.freeze();
 
-        let first_part_offset = offsets[parts_to_fetch[0]] as usize;
-        let slice_start = (range_start - first_part_offset).max(0);
-        let slice_end = if let Some(range_end) = range_end {
-            slice_start + (range_end - range_start)
+        let first_part_offset = usize::try_from(offsets[parts_to_fetch[0]])
+            .map_err(|_| anyhow!("Object offset does not fit in usize"))?;
+        if first_part_offset > range_start {
+            return Err(anyhow!(
+                "The requested range is before the first stored part."
+            ));
+        }
+        let slice_start = range_start - first_part_offset;
+        if slice_start > result_bytes.len()
+            || (requested_len.is_some() && slice_start == result_bytes.len())
+        {
+            return Err(anyhow!(
+                "The requested range starts beyond the object data."
+            ));
+        }
+        let slice_end = if let Some(requested_len) = requested_len {
+            slice_start
+                .checked_add(requested_len)
+                .ok_or_else(|| anyhow!("The requested range is too large."))?
         } else {
             result_bytes.len()
         };
@@ -139,6 +133,10 @@ impl Storage {
         mut rx: mpsc::Receiver<Bytes>,
         min_part_size: usize,
     ) -> Result<()> {
+        if min_part_size == 0 {
+            return Err(anyhow!("min_part_size must be greater than zero"));
+        }
+
         let (tx_offset, mut rx_offset) = mpsc::channel::<u64>(16);
         let client = Arc::clone(&self.client);
         let bucket = bucket_name.to_string();
@@ -146,7 +144,7 @@ impl Storage {
 
         self.upsert_bucket(bucket_name).await?;
 
-        tokio::task::spawn(async move {
+        let offset_writer = tokio::task::spawn(async move {
             let mut offsets = Vec::new();
             while let Some(n) = rx_offset.recv().await {
                 offsets.push(n);
@@ -166,48 +164,46 @@ impl Storage {
         let mut buffer = BytesMut::new();
         let mut pkt_num = 0;
         let mut offset = 0;
-        while let Some(payload) = rx.recv().await {
-            buffer.extend_from_slice(&payload);
-            if buffer.len() >= min_part_size {
-                let client = Arc::clone(&self.client);
-                let bucket = bucket_name.to_string();
-                let key = object_key.to_string();
-                let len = buffer.len();
-                let part_data = buffer.split_to(len).freeze();
-                upload_part(client, bucket, key, part_data, pkt_num).await?;
-                pkt_num += 1;
-                tx_offset.send(offset).await?;
-                offset += len as u64;
+
+        let upload_result = async {
+            while let Some(payload) = rx.recv().await {
+                buffer.extend_from_slice(&payload);
+                if buffer.len() >= min_part_size {
+                    let client = Arc::clone(&self.client);
+                    let bucket = bucket_name.to_string();
+                    let key = object_key.to_string();
+                    let len = buffer.len();
+                    let part_data = buffer.split_to(len).freeze();
+                    upload_part(client, bucket, key, part_data, pkt_num).await?;
+                    tx_offset.send(offset).await?;
+                    pkt_num += 1;
+                    offset += len as u64;
+                }
             }
+
+            let client = Arc::clone(&self.client);
+            let bucket = bucket_name.to_string();
+            let key = object_key.to_string();
+            let remaining = buffer.freeze();
+
+            if !remaining.is_empty() || pkt_num == 0 {
+                upload_part(client, bucket, key, remaining, pkt_num).await?;
+                tx_offset.send(offset).await?;
+            }
+
+            Ok::<(), anyhow::Error>(())
         }
+        .await;
 
-        let client = Arc::clone(&self.client);
-        let bucket = bucket_name.to_string();
-        let key = object_key.to_string();
+        drop(tx_offset);
 
-        self.flush_remaining(
-            Arc::clone(&client),
-            bucket.to_string(),
-            key.to_string(),
-            buffer.freeze(),
-            pkt_num,
-        )
-        .await?;
+        let offset_result = offset_writer
+            .await
+            .map_err(|err| anyhow!("offset writer task failed: {err}"))?;
 
-        Ok(())
-    }
+        upload_result?;
+        offset_result?;
 
-    async fn flush_remaining(
-        &self,
-        client: Arc<Client>,
-        bucket: String,
-        key: String,
-        buffer: Bytes,
-        pkt_num: usize,
-    ) -> Result<()> {
-        if !buffer.is_empty() {
-            upload_part(client, bucket, key, buffer, pkt_num).await?;
-        }
         Ok(())
     }
 
@@ -289,11 +285,10 @@ async fn upload_part(
         .map_err(|e| anyhow!(e))
 }
 
-fn serialize_offsets(offsets: &Vec<u64>) -> Vec<u8> {
+fn serialize_offsets(offsets: &[u64]) -> Vec<u8> {
     offsets
         .iter()
-        .map(|&offset| offset.to_be_bytes())
-        .flatten()
+        .flat_map(|&offset| offset.to_be_bytes())
         .collect()
 }
 
@@ -313,13 +308,53 @@ fn deserialize_offsets(bytes: &[u8]) -> Result<Vec<u64>> {
     Ok(offsets)
 }
 
+fn inclusive_range_len(range_start: usize, range_end: Option<usize>) -> Result<Option<usize>> {
+    range_end
+        .map(|end| {
+            end.checked_sub(range_start)
+                .and_then(|len| len.checked_add(1))
+                .ok_or_else(|| anyhow!("Invalid byte range"))
+        })
+        .transpose()
+}
+
+fn part_indexes_for_range(
+    offsets: &[u64],
+    range_start: usize,
+    range_end: Option<usize>,
+) -> Result<Vec<usize>> {
+    let _ = inclusive_range_len(range_start, range_end)?;
+
+    if offsets.is_empty() {
+        return Err(anyhow!("No offsets found for object"));
+    }
+
+    let part_start_index = offsets
+        .partition_point(|&offset| offset <= range_start as u64)
+        .saturating_sub(1);
+
+    let mut parts_to_fetch = Vec::new();
+    for (i, offset) in offsets.iter().enumerate().skip(part_start_index) {
+        if let Some(range_end) = range_end {
+            if *offset > range_end as u64 {
+                break;
+            }
+        }
+        parts_to_fetch.push(i);
+    }
+
+    if parts_to_fetch.is_empty() {
+        return Err(anyhow!("The requested range is not covered by any parts."));
+    }
+
+    Ok(parts_to_fetch)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use bytes::Bytes;
     use std::env;
-    use std::sync::Arc;
-    use std::usize::MIN;
     use tokio::sync::mpsc;
 
     const TEST_ENDPOINT: &str = "http://localhost:9000";
@@ -336,6 +371,46 @@ mod tests {
         Storage::new(TEST_ENDPOINT.to_string(), key_id, secret_key)
     }
 
+    #[test]
+    fn serializes_offsets_as_big_endian_u64s() {
+        let bytes = serialize_offsets(&[0, 1, 258]);
+        assert_eq!(bytes.len(), 24);
+        assert_eq!(deserialize_offsets(&bytes).unwrap(), vec![0, 1, 258]);
+    }
+
+    #[test]
+    fn deserialize_offsets_rejects_partial_u64() {
+        let err = deserialize_offsets(&[0, 1, 2]).unwrap_err();
+        assert!(err.to_string().contains("Invalid byte length"));
+    }
+
+    #[test]
+    fn inclusive_range_len_counts_end_byte() {
+        assert_eq!(inclusive_range_len(0, Some(0)).unwrap(), Some(1));
+        assert_eq!(inclusive_range_len(10, Some(12)).unwrap(), Some(3));
+        assert_eq!(inclusive_range_len(10, None).unwrap(), None);
+    }
+
+    #[test]
+    fn inclusive_range_len_rejects_inverted_range() {
+        assert!(inclusive_range_len(12, Some(10)).is_err());
+    }
+
+    #[test]
+    fn part_indexes_cover_cross_part_ranges() {
+        let offsets = vec![0, 10, 20];
+        assert_eq!(
+            part_indexes_for_range(&offsets, 9, Some(10)).unwrap(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            part_indexes_for_range(&offsets, 10, Some(10)).unwrap(),
+            vec![1]
+        );
+        assert_eq!(part_indexes_for_range(&offsets, 21, None).unwrap(), vec![2]);
+    }
+
+    #[ignore = "requires local S3-compatible storage and TEST_KEY_ID/TEST_SECRET_KEY"]
     #[tokio::test]
     async fn test_bucket_creation() {
         let storage = create_storage();
@@ -343,6 +418,7 @@ mod tests {
         assert!(result.is_ok(), "Bucket creation failed: {:?}", result.err());
     }
 
+    #[ignore = "requires local S3-compatible storage and TEST_KEY_ID/TEST_SECRET_KEY"]
     #[tokio::test]
     async fn test_bucket_existence() {
         let storage = create_storage();
@@ -355,6 +431,7 @@ mod tests {
         assert!(result.unwrap(), "Bucket does not exist when it should.");
     }
 
+    #[ignore = "requires local S3-compatible storage and TEST_KEY_ID/TEST_SECRET_KEY"]
     #[tokio::test]
     async fn test_upload_and_retrieve_object() {
         let storage = create_storage();
@@ -377,7 +454,7 @@ mod tests {
         upload_task.await.unwrap();
 
         let fetched_data = storage
-            .fetch_object(TEST_BUCKET_NAME, "test-object/0")
+            .fetch_object(TEST_BUCKET_NAME, "test-object/0000000000")
             .await;
         assert!(
             fetched_data.is_ok(),
@@ -393,6 +470,7 @@ mod tests {
         );
     }
 
+    #[ignore = "requires local S3-compatible storage and TEST_KEY_ID/TEST_SECRET_KEY"]
     #[tokio::test]
     async fn test_list_bucket() {
         let storage = create_storage();
