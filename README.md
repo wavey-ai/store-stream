@@ -2,7 +2,9 @@
 
 A Rust library that provides a high-level interface for interacting with S3-compatible object storage services. This implementation includes support for multipart uploads, byte range fetching, and efficient handling of large objects.
 
-It is possible to stream multi-gb files to storage which will be saved at intervals of the minimum part size and can be addressed via byte range queries before the upload has completed.
+You can stream multi-gigabyte files to storage. The library saves data at
+minimum-part-size intervals. Byte-range queries can read saved data before the
+upload is complete.
 
 ## Features
 
