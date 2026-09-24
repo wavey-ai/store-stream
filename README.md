@@ -1,6 +1,6 @@
 # Store Stream
 
-A Rust library that provides a high-level interface for interacting with S3-compatible object storage services. This implementation includes support for multipart uploads, byte range fetching, and efficient handling of large objects.
+A Rust library that writes stream chunks to S3-compatible object storage and reads saved byte ranges.
 
 You can stream multi-gigabyte files to storage. The library saves data at
 minimum-part-size intervals. Byte-range queries can read saved data before the
@@ -8,7 +8,7 @@ upload is complete.
 
 ## Features
 
-- Multipart upload support with configurable minimum part size
+- Chunked object uploads with a configurable part size
 - Byte range fetching with offset tracking
 - Bucket management (creation, existence checking)
 - Object listing
@@ -55,6 +55,9 @@ An upload writes chunks under `object-key/0000000000`,
 big-endian `u64` offset table. The offset table is updated after each chunk is
 stored, so byte ranges can be fetched before a long upload has completed.
 
+Each chunk is a separate object. The library does not use the S3 multipart upload API.
+`Storage::upload` starts at part zero. It does not resume an interrupted call.
+
 ### Fetching Objects
 
 Fetch specific byte ranges from objects:
@@ -88,7 +91,7 @@ for object in result.objects {
 ## Features
 
 - **Path Style Access**: Forces path-style access for compatibility with various S3-compatible services
-- **Chunked Upload**: Automatically handles large file uploads by splitting them into chunks
+- **Chunked Upload**: Splits input into objects at the configured part size
 - **Offset Tracking**: Maintains object part offsets for efficient byte range access
 - **Streaming Support**: Uses Tokio channels for efficient streaming of data
 

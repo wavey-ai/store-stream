@@ -167,17 +167,21 @@ impl Storage {
 
         let upload_result = async {
             while let Some(payload) = rx.recv().await {
-                buffer.extend_from_slice(&payload);
-                if buffer.len() >= min_part_size {
-                    let client = Arc::clone(&self.client);
-                    let bucket = bucket_name.to_string();
-                    let key = object_key.to_string();
-                    let len = buffer.len();
-                    let part_data = buffer.split_to(len).freeze();
-                    upload_part(client, bucket, key, part_data, pkt_num).await?;
-                    tx_offset.send(offset).await?;
-                    pkt_num += 1;
-                    offset += len as u64;
+                let mut remaining = payload.as_ref();
+                while !remaining.is_empty() {
+                    let take = (min_part_size - buffer.len()).min(remaining.len());
+                    buffer.extend_from_slice(&remaining[..take]);
+                    remaining = &remaining[take..];
+                    if buffer.len() == min_part_size {
+                        let client = Arc::clone(&self.client);
+                        let bucket = bucket_name.to_string();
+                        let key = object_key.to_string();
+                        let part_data = buffer.split().freeze();
+                        upload_part(client, bucket, key, part_data, pkt_num).await?;
+                        tx_offset.send(offset).await?;
+                        pkt_num += 1;
+                        offset += min_part_size as u64;
+                    }
                 }
             }
 
@@ -305,6 +309,11 @@ fn deserialize_offsets(bytes: &[u8]) -> Result<Vec<u64>> {
         );
         offsets.push(offset);
     }
+    if offsets.first().copied().is_some_and(|first| first != 0)
+        || offsets.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err(anyhow!("Offsets must start at zero and increase"));
+    }
     Ok(offsets)
 }
 
@@ -382,6 +391,13 @@ mod tests {
     fn deserialize_offsets_rejects_partial_u64() {
         let err = deserialize_offsets(&[0, 1, 2]).unwrap_err();
         assert!(err.to_string().contains("Invalid byte length"));
+    }
+
+    #[test]
+    fn deserialize_offsets_rejects_invalid_order() {
+        assert!(deserialize_offsets(&serialize_offsets(&[1, 10])).is_err());
+        assert!(deserialize_offsets(&serialize_offsets(&[0, 10, 10])).is_err());
+        assert!(deserialize_offsets(&serialize_offsets(&[0, 20, 10])).is_err());
     }
 
     #[test]
@@ -468,6 +484,56 @@ mod tests {
             Bytes::from("Hello, S3!"),
             "Fetched data does not match uploaded data."
         );
+    }
+
+    #[ignore = "requires local S3-compatible storage and TEST_KEY_ID/TEST_SECRET_KEY"]
+    #[tokio::test]
+    async fn test_large_input_is_saved_as_fixed_size_parts() {
+        let storage = create_storage();
+        let key = format!(
+            "store-stream-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let payload = Bytes::from(vec![42; MIN_PART_SIZE * 2 + 31]);
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(payload.clone()).await.unwrap();
+        drop(tx);
+
+        storage
+            .upload(TEST_BUCKET_NAME, &key, rx, MIN_PART_SIZE)
+            .await
+            .unwrap();
+        let offsets = storage
+            .fetch_object(TEST_BUCKET_NAME, &format!("{key}.dat"))
+            .await
+            .unwrap();
+        assert_eq!(
+            deserialize_offsets(&offsets).unwrap(),
+            vec![0, MIN_PART_SIZE as u64, (MIN_PART_SIZE * 2) as u64]
+        );
+        assert_eq!(
+            storage
+                .get_byte_range(TEST_BUCKET_NAME, &key, 0, None)
+                .await
+                .unwrap(),
+            payload
+        );
+        for object in (0..3)
+            .map(|part| format!("{key}/{part:010}"))
+            .chain(std::iter::once(format!("{key}.dat")))
+        {
+            storage
+                .client
+                .delete_object()
+                .bucket(TEST_BUCKET_NAME)
+                .key(object)
+                .send()
+                .await
+                .unwrap();
+        }
     }
 
     #[ignore = "requires local S3-compatible storage and TEST_KEY_ID/TEST_SECRET_KEY"]
