@@ -7,6 +7,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::debug;
 
+pub mod resumable;
+
 #[derive(Clone)]
 pub struct Storage {
     client: Arc<Client>,
@@ -297,7 +299,7 @@ fn serialize_offsets(offsets: &[u64]) -> Vec<u8> {
 }
 
 fn deserialize_offsets(bytes: &[u8]) -> Result<Vec<u64>> {
-    if bytes.len() % 8 != 0 {
+    if !bytes.len().is_multiple_of(8) {
         return Err(anyhow!("Invalid byte length for offsets"));
     }
     let mut offsets = Vec::with_capacity(bytes.len() / 8);
@@ -371,7 +373,7 @@ mod tests {
     const MIN_PART_SIZE: usize = 1024 * 10;
 
     fn get_env_var(key: &str) -> String {
-        env::var(key).expect(&format!("Environment variable {} not set", key))
+        env::var(key).unwrap_or_else(|_| panic!("Environment variable {} not set", key))
     }
 
     fn create_storage() -> Storage {
